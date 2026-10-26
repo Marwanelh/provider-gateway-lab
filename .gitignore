@@ -11,3 +11,4 @@ ENV/
 htmlcov/
 *.log
 .env
+.venv/

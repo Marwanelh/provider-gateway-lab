@@ -1,82 +1,40 @@
-import time
-from typing import Dict, Any, List
+import math
+
 from pydantic import BaseModel, Field
 
-# Pricing per million tokens (standard 2026 production reference)
-MODEL_PRICING = {
-    "claude-3-5-sonnet": {"input": 3.00, "output": 15.00},
-    "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "deepseek-chat": {"input": 0.14, "output": 0.28}
-}
 
 class RequestTelemetry(BaseModel):
     request_id: str
-    model_used: str
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-    estimated_cost_usd: float
-    latency_ms: float
+    provider: str
+    latency_ms: float = Field(ge=0)
     cache_hit: bool
-    fallback_triggered: bool
+    retryable_failures: int = Field(ge=0)
+
 
 class TelemetryCollector:
-    def __init__(self):
-        self.history: List[RequestTelemetry] = []
-        self.total_cost_saved_usd: float = 0.0
+    def __init__(self) -> None:
+        self.history: list[RequestTelemetry] = []
 
-    def record_request(
-        self,
-        request_id: str,
-        model: str,
-        prompt_tokens: int,
-        completion_tokens: int,
-        latency_ms: float,
-        cache_hit: bool,
-        fallback_triggered: bool = False
-    ) -> RequestTelemetry:
-        pricing = MODEL_PRICING.get(model, {"input": 2.0, "output": 8.0})
-        
-        if cache_hit:
-            cost = 0.0
-            # Cost that would have been incurred
-            saved = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000.0
-            self.total_cost_saved_usd += saved
-        else:
-            cost = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000.0
-
-        item = RequestTelemetry(
-            request_id=request_id,
-            model_used=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            estimated_cost_usd=round(cost, 6),
-            latency_ms=round(latency_ms, 2),
-            cache_hit=cache_hit,
-            fallback_triggered=fallback_triggered
-        )
+    def record(self, item: RequestTelemetry) -> None:
         self.history.append(item)
-        return item
 
-    def get_summary(self) -> Dict[str, Any]:
-        total_reqs = len(self.history)
-        if total_reqs == 0:
-            return {"total_requests": 0, "cache_hit_ratio": 0.0}
-
-        cache_hits = sum(1 for r in self.history if r.cache_hit)
-        total_spend = sum(r.estimated_cost_usd for r in self.history)
-        latencies = [r.latency_ms for r in self.history]
-        latencies.sort()
-        p95_idx = int(total_reqs * 0.95)
-
+    def summary(self) -> dict[str, int | float]:
+        if not self.history:
+            return {
+                "total_requests": 0,
+                "cache_hits": 0,
+                "cache_hit_ratio": 0.0,
+                "requests_with_failover": 0,
+            }
+        latencies = sorted(item.latency_ms for item in self.history)
+        hits = sum(item.cache_hit for item in self.history)
+        failovers = sum(item.retryable_failures > 0 for item in self.history)
+        p95_index = math.ceil(0.95 * len(latencies)) - 1
         return {
-            "total_requests": total_reqs,
-            "cache_hit_count": cache_hits,
-            "cache_hit_ratio": round(cache_hits / total_reqs, 4),
-            "total_spend_usd": round(total_spend, 6),
-            "total_cost_saved_usd": round(self.total_cost_saved_usd, 6),
-            "p50_latency_ms": latencies[total_reqs // 2],
-            "p95_latency_ms": latencies[min(p95_idx, total_reqs - 1)]
+            "total_requests": len(self.history),
+            "cache_hits": hits,
+            "cache_hit_ratio": round(hits / len(self.history), 4),
+            "requests_with_failover": failovers,
+            "p50_latency_ms": latencies[(len(latencies) - 1) // 2],
+            "p95_latency_ms": latencies[p95_index],
         }

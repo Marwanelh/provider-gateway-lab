@@ -1,51 +1,47 @@
 import hashlib
+import json
 import time
-from typing import Dict, Any, Optional
-from pydantic import BaseModel
+from dataclasses import dataclass
+from typing import Any, Callable
 
-class CachedEntry(BaseModel):
-    response_text: str
-    model: str
-    tokens: int
-    created_at: float
-    ttl_seconds: int
 
-class SemanticCache:
-    """
-    In-memory semantic cache with Redis compatibility.
-    Normalizes whitespace and computes SHA256 fingerprints to eliminate redundant LLM calls.
-    """
-    def __init__(self, default_ttl: int = 3600):
-        self._store: Dict[str, CachedEntry] = {}
+@dataclass(frozen=True)
+class CacheEntry:
+    value: dict[str, Any]
+    expires_at: float
+
+
+class ExactResponseCache:
+    """TTL cache keyed by every request field that can affect a response."""
+
+    def __init__(
+        self, default_ttl: int = 300, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        if default_ttl <= 0:
+            raise ValueError("default_ttl must be positive")
         self.default_ttl = default_ttl
+        self.clock = clock
+        self._store: dict[str, CacheEntry] = {}
 
-    def _generate_key(self, prompt: str, model: str) -> str:
-        normalized = " ".join(prompt.lower().strip().split())
-        payload = f"{model}:{normalized}"
-        return hashlib.sha256(payload.encode()).hexdigest()
+    @staticmethod
+    def key(payload: dict[str, Any]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest()
 
-    def get(self, prompt: str, model: str) -> Optional[CachedEntry]:
-        key = self._generate_key(prompt, model)
+    def get(self, key: str) -> dict[str, Any] | None:
         entry = self._store.get(key)
         if not entry:
             return None
-        
-        # Check TTL expiration
-        if time.time() - entry.created_at > entry.ttl_seconds:
+        if self.clock() >= entry.expires_at:
             del self._store[key]
             return None
-            
-        return entry
+        return entry.value.copy()
 
-    def set(self, prompt: str, model: str, response_text: str, tokens: int, ttl: int = None) -> None:
-        key = self._generate_key(prompt, model)
-        self._store[key] = CachedEntry(
-            response_text=response_text,
-            model=model,
-            tokens=tokens,
-            created_at=time.time(),
-            ttl_seconds=ttl or self.default_ttl
-        )
+    def set(self, key: str, value: dict[str, Any], ttl: int | None = None) -> None:
+        lifetime = ttl if ttl is not None else self.default_ttl
+        if lifetime <= 0:
+            raise ValueError("ttl must be positive")
+        self._store[key] = CacheEntry(value.copy(), self.clock() + lifetime)
 
     def clear(self) -> None:
         self._store.clear()

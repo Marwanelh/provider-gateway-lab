@@ -1,22 +1,35 @@
+import asyncio
 import time
+from typing import Callable
+
 
 class TokenBucketRateLimiter:
-    """
-    Token bucket rate limiter to prevent upstream quota exhaustion.
-    """
-    def __init__(self, capacity: int = 100, refill_rate_per_sec: float = 10.0):
+    def __init__(
+        self,
+        capacity: float,
+        refill_rate_per_second: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if capacity <= 0 or refill_rate_per_second < 0:
+            raise ValueError("capacity must be positive and refill rate cannot be negative")
         self.capacity = capacity
-        self.refill_rate = refill_rate_per_sec
-        self.tokens = float(capacity)
-        self.last_refill = time.time()
+        self.refill_rate = refill_rate_per_second
+        self.clock = clock
+        self.tokens = capacity
+        self.last_refill = clock()
+        self._lock = asyncio.Lock()
 
-    def allow_request(self, cost: float = 1.0) -> bool:
-        now = time.time()
-        elapsed = now - self.last_refill
-        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
-        self.last_refill = now
-
-        if self.tokens >= cost:
+    async def allow(self, cost: float = 1) -> bool:
+        if cost <= 0 or cost > self.capacity:
+            raise ValueError("cost must be positive and no greater than capacity")
+        async with self._lock:
+            now = self.clock()
+            elapsed = max(0, now - self.last_refill)
+            self.tokens = min(
+                self.capacity, self.tokens + elapsed * self.refill_rate
+            )
+            self.last_refill = now
+            if self.tokens < cost:
+                return False
             self.tokens -= cost
             return True
-        return False
