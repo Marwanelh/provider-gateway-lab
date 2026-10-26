@@ -1,43 +1,59 @@
 import asyncio
-import logging
-from typing import Dict, Any, Tuple, Optional
+from dataclasses import dataclass
 
-logger = logging.getLogger(__name__)
 
-class LLMProviderRouter:
-    """
-    Orchestrates requests across multi-provider failover chains:
-    Primary (e.g. Claude 3.5 Sonnet) -> Secondary (GPT-4o) -> Fallback (DeepSeek).
-    Interprets HTTP 429 (Rate Limits) and 503 (Outages) to seamlessly switch upstream.
-    """
-    def __init__(self, simulate_upstream_failures: bool = False):
-        self.simulate_failures = simulate_upstream_failures
-        self.failover_order = ["claude-3-5-sonnet", "gpt-4o", "deepseek-chat"]
+class RetryableProviderError(RuntimeError):
+    pass
 
-    async def execute_request(self, prompt: str, requested_model: str) -> Tuple[str, str, int, bool]:
-        """
-        Executes prompt through fallback chain.
-        Returns: (response_text, actual_model_used, total_tokens, fallback_triggered)
-        """
-        chain = [requested_model] + [m for m in self.failover_order if m != requested_model]
-        fallback_triggered = False
 
-        for idx, model in enumerate(chain):
+@dataclass(frozen=True)
+class ProviderResult:
+    text: str
+    provider: str
+
+
+class DemoProvider:
+    """Deterministic local provider used to exercise routing without API credentials."""
+
+    def __init__(self, name: str, *, fail: bool = False) -> None:
+        self.name = name
+        self.fail = fail
+
+    async def complete(self, prompt: str, max_output_chars: int) -> ProviderResult:
+        await asyncio.sleep(0)
+        if self.fail:
+            raise RetryableProviderError(f"{self.name} is temporarily unavailable")
+        text = f"Demo response from {self.name}: {prompt}"[:max_output_chars]
+        return ProviderResult(text=text, provider=self.name)
+
+
+class ProviderRouter:
+    def __init__(self, providers: list[DemoProvider]) -> None:
+        if not providers:
+            raise ValueError("at least one provider is required")
+        if len({provider.name for provider in providers}) != len(providers):
+            raise ValueError("provider names must be unique")
+        self.providers = providers
+
+    async def complete(
+        self, prompt: str, preferred_provider: str | None, max_output_chars: int
+    ) -> tuple[ProviderResult, int]:
+        ordered = self.providers
+        if preferred_provider:
+            match = next(
+                (p for p in self.providers if p.name == preferred_provider), None
+            )
+            if not match:
+                raise ValueError(f"unknown provider '{preferred_provider}'")
+            ordered = [match] + [p for p in self.providers if p is not match]
+
+        retryable_failures = 0
+        for provider in ordered:
             try:
-                # Mock upstream API call with simulated latency
-                await asyncio.sleep(0.08)
-                
-                # Check for simulated failover test cases
-                if self.simulate_failures and idx == 0:
-                    raise ConnectionResetError("Upstream Provider 429 Rate Limit Exceeded")
-
-                tokens = len(prompt.split()) + 35
-                response = f"[{model}] Verified completion for query: '{prompt[:45]}...'"
-                return response, model, tokens, fallback_triggered
-
-            except Exception as e:
-                logger.warning(f"[Provider Failover] {model} failed with: {str(e)}. Escalating to next in chain.")
-                fallback_triggered = True
-                continue
-
-        raise RuntimeError("All configured upstream LLM providers exhausted without response.")
+                return (
+                    await provider.complete(prompt, max_output_chars),
+                    retryable_failures,
+                )
+            except RetryableProviderError:
+                retryable_failures += 1
+        raise RetryableProviderError("all demo providers are unavailable")

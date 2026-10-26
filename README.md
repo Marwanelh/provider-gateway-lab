@@ -1,142 +1,87 @@
-# High-Performance LLM Gateway & Caching Proxy
+# Provider Gateway Lab
 
-[![CI](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)]()
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)]()
-[![Redis](https://img.shields.io/badge/Cache-Semantic%20Redis-red.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+A local FastAPI reference implementation for the backend concerns around AI-provider integrations: request validation, exact response caching, concurrency-safe rate limiting, retryable failover, and observable request telemetry.
 
-An asynchronous reverse proxy and routing middleware for Large Language Model deployments. Features **semantic response caching**, **dynamic multi-provider fallback** (Claude 3.5 Sonnet, GPT-4o, DeepSeek), **token-bucket rate limiting**, and **real-time token spend telemetry**.
+## Honest scope
 
----
+This project uses deterministic local demo providers. It does not call OpenAI, Anthropic, DeepSeek, or another external service; it does not claim compatibility with their APIs; and it does not report guessed token costs or production performance.
 
-## 🏗 Architecture Overview
+The purpose is to make the gateway behavior runnable and reviewable without credentials while keeping the integration boundaries clear.
+
+## Architecture
 
 ```mermaid
-flowchart TD
-    A[Client Request / OpenAI-Compatible SDK] --> B[FastAPI Gateway]
-    
-    B --> C[Token Bucket Rate Limiter]
-    C -->|Allowed| D{Semantic Cache Check}
-    C -->|Rate Limit Exceeded| E[HTTP 429 Throttle]
-    
-    D -->|Cache Hit: <15ms| F[Instant Cached Return $0 Token Cost]
-    
-    D -->|Cache Miss| G[Provider Router & Fallback Chain]
-    
-    subgraph Multi-Provider Fallback Cascade
-        G -->|Primary Attempt| H[Anthropic Claude 3.5 Sonnet]
-        H -->|HTTP 429 / 5xx Outage| I[OpenAI GPT-4o Secondary]
-        I -->|Outage / Timeout| J[DeepSeek Open-Weights Fallback]
-    end
-    
-    H -->|Success| K[Response Synthesizer]
-    I -->|Success| K
-    J -->|Success| K
-    
-    K --> L[Asynchronous Cache Populate]
-    K --> M[Telemetry Tracker: Cost & Latency p95]
-    M --> N[Client Completion]
+flowchart LR
+    A[Validated request] --> B[Token bucket]
+    B --> C{Exact cache hit?}
+    C -- Yes --> D[Cached response]
+    C -- No --> E[Preferred demo provider]
+    E -- Retryable failure --> F[Backup demo provider]
+    E -- Success --> G[Cache response]
+    F --> G
+    D --> H[Observed telemetry]
+    G --> H
 ```
 
----
+## What it demonstrates
 
-## 🌟 Key Capabilities
+- Bounded Pydantic request contracts
+- Cache keys that include every response-affecting request field
+- TTL expiration with an injectable monotonic clock
+- Async-lock-protected token-bucket rate limiting
+- Explicit retryable provider errors and ordered failover
+- Telemetry based on observed requests, latency, cache hits, and failovers
+- Clear HTTP 400, 422, 429, and 503 behavior
+- Automated tests and GitHub Actions
 
-1. **Semantic Caching Layer:** Hashes prompt tokens and normalizes whitespace variations. Serves repeated prompts in `<15ms` with zero upstream model spend.
-2. **Provider Failover Cascade:** Automatically switches from Claude 3.5 Sonnet to GPT-4o or DeepSeek when an upstream vendor throws rate limits (429) or service degradation (503).
-3. **Token-Bucket Rate Limiter:** Protects upstream budgets and prevents abuse via smooth token-refill pacing.
-4. **Real-time Observability:** Tracks token throughput, p50/p95 latency percentiles, and cumulative USD savings.
-
----
-
-## ⚙️ Architecture Trade-Offs
-
-| Decision | Chosen Solution | Alternative Considered | Rationale |
-|---|---|---|---|
-| **Caching Layer** | Token-Normalized Semantic Key Hash | Unstructured Vector DB Lookup | High-frequency API proxies require sub-millisecond cache evaluations. Vector distance lookups add 30-50ms overhead, whereas normalized hash keys resolve in `<1ms`. |
-| **Failover Strategy** | Tiered Dynamic Fallback | Hard Fail on 429 | Upstream LLM providers experience frequent intermittent rate limits. Automatic cascade ensures 99.9% uptime without breaking client applications. |
-| **API Contract** | OpenAI-Compatible Chat Completions | Custom Schema | Drops in seamlessly with existing `openai-python`, LangChain, or Vercel AI SDK setups with just a single `base_url` change. |
-
----
-
-## 🚀 Quickstart
-
-### Option 1: Docker Compose
+## Run
 
 ```bash
-docker-compose up --build
-```
-Gateway running on `http://localhost:8002` (Docs: `http://localhost:8002/docs`).
-
-### Option 2: Local Setup
-
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: .\venv\Scripts\activate
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-
 uvicorn src.main:app --reload --port 8002
 ```
 
----
-
-## 📡 API Reference
-
-### 1. OpenAI-Compatible Chat Completions (`POST /v1/chat/completions`)
+Open `http://localhost:8002/docs` for the interactive API.
 
 ```bash
-curl -X POST "http://localhost:8002/v1/chat/completions" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "model": "claude-3-5-sonnet",
-       "messages": [
-         {"role": "system", "content": "You are a concise engineering assistant."},
-         {"role": "user", "content": "How do you handle rate limits gracefully?"}
-       ]
-     }'
+python -m pytest -q
 ```
 
-Response includes standard choice objects alongside gateway telemetry:
-```json
-{
-  "id": "chatcmpl_9b32af84b102",
-  "model": "claude-3-5-sonnet",
-  "choices": [...],
-  "telemetry": {
-    "prompt_tokens": 28,
-    "completion_tokens": 42,
-    "estimated_cost_usd": 0.000714,
-    "latency_ms": 14.2,
-    "cache_hit": true,
-    "fallback_triggered": false
-  }
-}
-```
-
-### 2. Telemetry & Cost Metrics (`GET /metrics`)
-Returns total requests, cache hit ratio, and cumulative dollars saved:
-
-```json
-{
-  "total_requests": 1420,
-  "cache_hit_ratio": 0.412,
-  "total_spend_usd": 1.248,
-  "total_cost_saved_usd": 0.892,
-  "p95_latency_ms": 48.2
-}
-```
-
----
-
-## 🧪 Testing
+## Example
 
 ```bash
-pytest tests/ -v
+curl -X POST http://localhost:8002/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Explain safe retries"}],
+    "temperature": 0.2,
+    "max_output_chars": 500
+  }'
 ```
 
----
+Endpoints:
 
-## 📄 License
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/v1/responses` | Validate, limit, cache, and route a request |
+| `GET` | `/metrics` | Read observed in-process metrics |
+| `GET` | `/health` | Health check |
 
-MIT © [Marwane Elhour](https://github.com/Marwanelh)
+## Production upgrade path
+
+- Implement authenticated provider adapters behind the same router contract.
+- Replace the in-memory cache and telemetry store with shared infrastructure.
+- Add per-tenant limits, authentication, request IDs from trusted boundaries, and audit retention.
+- Use vendor-reported usage and a versioned pricing source if cost reporting is needed.
+- Define retry budgets, jittered backoff, circuit breakers, and idempotency behavior from provider contracts.
+
+## Scope
+
+Independent portfolio project using synthetic requests only. It contains no FillFlow code, client data, credentials, or production metrics.
+
+## Author
+
+[Marwane Elhour](https://github.com/Marwanelh) · [LinkedIn](https://www.linkedin.com/in/marwanelh/)

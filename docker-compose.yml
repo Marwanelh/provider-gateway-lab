@@ -1,15 +1,8 @@
-version: '3.8'
-
 services:
   gateway:
     build: .
-    container_name: llm_gateway_proxy
     ports:
       - "8002:8002"
-    environment:
-      - ENVIRONMENT=production
-      - LOG_LEVEL=INFO
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 30s
